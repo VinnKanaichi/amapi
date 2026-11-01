@@ -1,0 +1,8 @@
+
+{
+  "functions": {
+    "api/preset.js": {
+      "maxDuration": 10
+    }
+  }
+}
