@@ -6,55 +6,61 @@ export const config = {
   maxDuration: 300
 };
 
-export default async function handler(req, res) {
-  let browser;
-  let page;
+const PLAYER_URL = "https://am.izzxd.my.id/player/preset?alight=";
 
+function safeError(error) {
+  return {
+    message: error?.message || String(error),
+    stack: error?.stack || null
+  };
+}
+
+export default async function handler(req, res) {
   const startedAt = Date.now();
   const logs = [];
+  const pageErrors = [];
+  const consoleErrors = [];
+  const failedRequests = [];
+  const httpErrors = [];
 
-  const log = (step, data = null) => {
+  const log = (message, data = null) => {
     const entry = {
-      step,
+      time: new Date().toISOString(),
       elapsedMs: Date.now() - startedAt,
-      ...(data !== null ? { data } : {})
+      message,
+      data
     };
 
     logs.push(entry);
-    console.log("[AM DEBUG]", JSON.stringify(entry));
+    console.log(JSON.stringify(entry));
   };
 
-  const response = (status, data) => {
-    return res.status(status).json({
-      ...data,
-      elapsedMs: Date.now() - startedAt,
-      logs
-    });
-  };
+  let browser;
 
   try {
     if (req.method !== "GET") {
-      return response(405, {
+      return res.status(405).json({
         success: false,
         error: "Method not allowed"
       });
     }
 
-    // API key
-    const apiKey = process.env.TEST_API_KEY;
+    const apiKey = req.headers["x-api-key"];
 
-    if (!apiKey || req.headers["x-api-key"] !== apiKey) {
-      return response(401, {
+    if (
+      !process.env.TEST_API_KEY ||
+      apiKey !== process.env.TEST_API_KEY
+    ) {
+      return res.status(401).json({
         success: false,
         error: "Unauthorized"
       });
     }
 
-    // Validasi URL preset
     const presetUrl = req.query.url;
 
     if (!presetUrl) {
-      return response(400, {
+      return res.status(400).json({
         success: false,
         error: "Parameter url wajib diisi"
       });
@@ -65,23 +71,23 @@ export default async function handler(req, res) {
     try {
       parsedUrl = new URL(presetUrl);
     } catch {
-      return response(400, {
+      return res.status(400).json({
         success: false,
-        error: "URL tidak valid"
+        error: "URL preset tidak valid"
       });
     }
 
     if (
-      !["alightcreative.com", "www.alightcreative.com"]
-        .includes(parsedUrl.hostname)
+      parsedUrl.hostname !== "alightcreative.com" &&
+      !parsedUrl.hostname.endsWith(".alightcreative.com")
     ) {
-      return response(400, {
+      return res.status(400).json({
         success: false,
         error: "Domain preset tidak diizinkan"
       });
     }
 
-    log("Starting Chromium");
+    log("Memulai Chromium");
 
     browser = await playwright.launch({
       args: chromium.args,
@@ -89,268 +95,204 @@ export default async function handler(req, res) {
       headless: true
     });
 
-    page = await browser.newPage({
+    const page = await browser.newPage({
       viewport: {
-        width: 720,
-        height: 1280
+        width: 1280,
+        height: 900
       }
     });
 
-    page.setDefaultTimeout(30000);
-
-    const pageErrors = [];
-    const consoleErrors = [];
-
     page.on("pageerror", error => {
       pageErrors.push(error.message);
-      log("Page error", error.message);
+      log("PAGE ERROR", error.message);
     });
 
     page.on("console", message => {
       if (message.type() === "error") {
         consoleErrors.push(message.text());
+        log("CONSOLE ERROR", message.text());
       }
     });
 
     page.on("requestfailed", request => {
-      log("Request failed", {
+      const item = {
         url: request.url(),
-        error: request.failure()?.errorText
-      });
+        error: request.failure()?.errorText || "Unknown"
+      };
+
+      failedRequests.push(item);
+      log("REQUEST FAILED", item);
+    });
+
+    page.on("response", response => {
+      if (response.status() >= 400) {
+        const item = {
+          status: response.status(),
+          url: response.url()
+        };
+
+        httpErrors.push(item);
+        log("HTTP ERROR", item);
+      }
     });
 
     const playerUrl =
-      "https://am.izzxd.my.id/player/preset?alight=" +
-      encodeURIComponent(presetUrl);
+      PLAYER_URL + encodeURIComponent(presetUrl);
 
-    log("Opening AM Player");
+    log("Membuka AM Player", {
+      url: playerUrl
+    });
 
     await page.goto(playerUrl, {
       waitUntil: "domcontentloaded",
-      timeout: 60000
+      timeout: 120000
     });
 
-    log("Player document loaded");
+    log("Menunggu AM.renderVideo tersedia");
 
-    // Tunggu AM Player tersedia.
-    await page.waitForFunction(() => {
-      return typeof window.AM?.renderVideo === "function";
-    }, {
-      timeout: 60000
-    });
-
-    log("AM Player initialized");
-
-    // Tunggu kesiapan player.
-    const ready = await page.evaluate(async () => {
-      if (typeof AM.waitReady === "function") {
-        await AM.waitReady();
+    await page.waitForFunction(
+      () =>
+        window.AM &&
+        typeof window.AM.renderVideo === "function",
+      {
+        timeout: 120000
       }
+    );
+
+    log("AM Player berhasil dimuat");
+
+    // Tunggu preset siap.
+    log("Menunggu AM.waitReady()");
+
+    const readyResult = await page.evaluate(async () => {
+      const result = await window.AM.waitReady();
 
       return {
-        durationMs: AM.durationMs ?? null,
-        state: AM.getState?.() ?? null,
-        methods: Object.keys(AM)
+        result,
+        durationMs: window.AM.durationMs,
+        state: window.AM.getState(),
+        projects: window.AM.getAvailableProjects()
       };
     });
 
-    log("Player ready", ready);
+    log("Preset siap", readyResult);
 
-    // Diagnostik browser dan encoder.
-    const diagnostics = await page.evaluate(async () => {
-      const result = {
+    // Periksa kemampuan export browser.
+    const exportSupport = await page.evaluate(() => {
+      return window.AM.checkExportSupport();
+    });
+
+    log("Export support", exportSupport);
+
+    // Ambil kondisi browser.
+    const browserDiagnostics = await page.evaluate(() => {
+      const canvas = document.createElement("canvas");
+
+      return {
         userAgent: navigator.userAgent,
-        webCodecs: typeof VideoEncoder !== "undefined",
+        videoEncoder: typeof VideoEncoder !== "undefined",
         videoFrame: typeof VideoFrame !== "undefined",
         offscreenCanvas: typeof OffscreenCanvas !== "undefined",
         mediaRecorder: typeof MediaRecorder !== "undefined",
-        webGL: false,
-        h264: null,
-        vp8: null,
-        vp9: null
+        webgl: Boolean(
+          canvas.getContext("webgl") ||
+          canvas.getContext("webgl2")
+        )
       };
-
-      const canvas = document.createElement("canvas");
-
-      result.webGL = !!(
-        canvas.getContext("webgl2") ||
-        canvas.getContext("webgl")
-      );
-
-      if (typeof VideoEncoder !== "undefined") {
-        const configs = {
-          h264: {
-            codec: "avc1.42001f",
-            width: 480,
-            height: 854,
-            bitrate: 2000000,
-            framerate: 30
-          },
-          vp8: {
-            codec: "vp8",
-            width: 480,
-            height: 854,
-            bitrate: 2000000,
-            framerate: 30
-          },
-          vp9: {
-            codec: "vp09.00.10.08",
-            width: 480,
-            height: 854,
-            bitrate: 2000000,
-            framerate: 30
-          }
-        };
-
-        for (const [name, config] of Object.entries(configs)) {
-          result[name] = await VideoEncoder
-            .isConfigSupported(config)
-            .then(value => ({
-              supported: value.supported,
-              config: value.config ?? null
-            }))
-            .catch(error => ({
-              supported: false,
-              error: error.message
-            }));
-        }
-      }
-
-      return result;
     });
 
-    log("Browser diagnostics", diagnostics);
+    log("Browser diagnostics", browserDiagnostics);
 
-    // Periksa dukungan ekspor AM Player.
-    let exportSupport = null;
+    // Mulai render. Tidak ada timeout buatan di bagian ini.
+    log("RENDER DIMULAI", {
+      resolution: 480,
+      fps: 30,
+      quality: 0.5
+    });
 
-    try {
-      exportSupport = await page.evaluate(async () => {
-        if (typeof AM.checkExportSupport === "function") {
-          return await AM.checkExportSupport();
+    const renderResult = await page.evaluate(async () => {
+      return await window.AM.renderVideo({
+        resolution: 480,
+        fps: 30,
+        quality: 0.5,
+
+        onProgress(progress) {
+          console.log(
+            "[RENDER_PROGRESS]",
+            JSON.stringify(progress)
+          );
         }
-
-        return null;
       });
+    });
 
-      log("Export support checked", exportSupport);
-    } catch (error) {
-      log("Export support check failed", error.message);
-    }
+    log("RENDER SELESAI");
 
-    // Jika browser tidak punya WebCodecs, jangan mulai render.
-    if (!diagnostics.webCodecs) {
-      return response(200, {
-        success: false,
-        stage: "browser-diagnostics",
-        error: "VideoEncoder tidak tersedia",
-        ready,
-        diagnostics,
-        exportSupport,
-        pageErrors,
-        consoleErrors
-      });
-    }
+    // Ambil progress dan state terakhir.
+    const finalDiagnostics = await page.evaluate(() => {
+      return {
+        progress: window.AM.getRenderProgress(),
+        state: window.AM.getState()
+      };
+    });
 
-    // Jalankan render dan pantau progres.
-    log("Starting render");
-
-    const renderPromise = page.evaluate(async () => {
-      try {
-        const result = await AM.renderVideo({
-          resolution: 480,
-          fps: 30,
-          quality: 0.5,
-
-          onProgress(progress) {
-            window.__amDebugProgress = progress;
-          }
-        });
-
-        return {
-          success: result?.success ?? false,
-          durationSec: result?.durationSec ?? null,
-          sizeBytes: result?.sizeBytes ?? null,
-          type: result?.type ?? null,
+    // Jangan kirim Base64 MP4 mentah ke response JSON.
+    // Simpan hanya informasi hasil untuk pengujian.
+    const renderSummary = renderResult
+      ? {
+          success: renderResult.success ?? null,
+          durationSec: renderResult.durationSec ?? null,
+          sizeBytes: renderResult.sizeBytes ?? null,
+          type: renderResult.type ?? null,
+          hasBlobUrl: Boolean(renderResult.blobUrl),
+          hasBase64: Boolean(renderResult.base64),
           base64Length:
-            typeof result?.base64 === "string"
-              ? result.base64.length
+            typeof renderResult.base64 === "string"
+              ? renderResult.base64.length
               : 0,
-          base64Prefix:
-            typeof result?.base64 === "string"
-              ? result.base64.slice(0, 40)
-              : null
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error.message
-        };
-      }
-    });
+          otherKeys: Object.keys(renderResult)
+        }
+      : null;
 
-    let renderResult;
+    log("Hasil render", renderSummary);
 
-    const renderTimeout = new Promise(resolve => {
-      setTimeout(() => {
-        resolve({
-          success: false,
-          timeout: true,
-          message: "Render melewati batas waktu 120 detik"
-        });
-      }, 120000);
-    });
-
-    renderResult = await Promise.race([
-      renderPromise,
-      renderTimeout
-    ]);
-
-    log("Render result", renderResult);
-
-    // Ambil progres dan state terakhir.
-    let finalProgress = null;
-
-    try {
-      finalProgress = await page.evaluate(() => ({
-        progress: AM.getRenderProgress?.() ?? null,
-        callbackProgress: window.__amDebugProgress ?? null,
-        state: AM.getState?.() ?? null
-      }));
-
-      log("Final render progress", finalProgress);
-    } catch (error) {
-      log("Progress read failed", error.message);
-    }
-
-    return response(200, {
-      success: !renderResult.timeout && renderResult.success,
-      stage: renderResult.timeout
-        ? "render-timeout"
-        : "render-finished",
-      ready,
-      diagnostics,
+    return res.status(200).json({
+      success: true,
+      message: "Render selesai",
+      elapsedMs: Date.now() - startedAt,
+      ready: readyResult,
       exportSupport,
-      render: renderResult,
-      finalProgress,
+      browserDiagnostics,
+      render: renderSummary,
+      finalDiagnostics,
+      logs,
       pageErrors,
-      consoleErrors
+      consoleErrors,
+      failedRequests,
+      httpErrors
     });
 
   } catch (error) {
-    log("Fatal error", error.message);
+    log("TERJADI ERROR", safeError(error));
 
-    return response(500, {
+    return res.status(500).json({
       success: false,
-      stage: "fatal",
-      error: error.message
+      error: safeError(error),
+      elapsedMs: Date.now() - startedAt,
+      logs,
+      pageErrors,
+      consoleErrors,
+      failedRequests,
+      httpErrors
     });
 
   } finally {
     if (browser) {
-      await browser.close().catch(error => {
-        console.error("[AM DEBUG] Browser close:", error.message);
-      });
+      try {
+        await browser.close();
+        log("Chromium ditutup");
+      } catch (error) {
+        console.error("Gagal menutup Chromium:", error.message);
+      }
     }
   }
 }
