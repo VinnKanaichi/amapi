@@ -3,5 +3,7 @@
   "name": "am-export-api",
   "version": "1.0.0",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "playwright-core": "^1.56.1",
+"@sparticuz/chromium": "^141.0.0"
 }
